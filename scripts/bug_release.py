@@ -13,11 +13,13 @@
 
 import argparse
 import csv
+import datetime
 from dateutil.relativedelta import relativedelta
 import json
 from libmozdata.bugzilla import Bugzilla
 from logger import logger
 import productdates
+import pytz
 import utils
 
 PRODUCTS_TO_CHECK = [
@@ -33,12 +35,32 @@ PRODUCTS_TO_CHECK = [
 
 # TODO: Drop deprecated severities once existing uses have been updated
 #       https://bugzilla.mozilla.org/show_bug.cgi?id=1564608
-SEVERITIES = {'blocker': 'blocker+critical+major',
+SEVERITIES = {
+              'blocker': 'blocker+critical+major',
               'critical': 'blocker+critical+major',
               'major': 'blocker+critical+major',
               'normal': 'normal',
               'minor': 'minor+trivial',
-              'trivial': 'minor+trivial'}
+              'trivial': 'minor+trivial',
+              'enhancement': 'enhancement',
+             }
+
+SEVERITIES_LIST = [
+                   'enhancement',
+                   'trivial',
+                   'minor',
+                   'normal',
+                   'major',
+                   'critical',
+                   'blocker',
+                  ]
+
+SEVERITIES_GROUP_LIST = [
+                         'enhancement',
+                         'minor+trivial',
+                         'normal',
+                         'blocker+critical+major',
+                        ]
 
 WFMT = '{}-{:02d}'
 
@@ -72,26 +94,169 @@ def get_weeks(start_date, end_date):
 
 def get_bugs(major):
 
-    def bug_handler(bug, data):
+    def bug_handler(bug_data, other_data):
+        data_opened = other_data['data_opened']
+        phase = other_data['phase']
+
         if bzdata_save_path:
-            add_bugzilla_data_to_save(['opened', 'nightly'], bug)
-        sev = bug['severity']
-        creation = utils.get_date(bug['creation_time'])
+            add_bugzilla_data_to_save(['opened', phase], bug_data)
+
+        pre_release_phase = True
+
+        # Questions investigated:
+        # 1. Which bugs saw their severity lowered before release (from blocker
+        #    etc.)?
+        # 2. Which bugs saw their severity increased after release (to blocker
+        #    etc.)?
+        severity_highest_index_before_release = None
+        severity_index_at_release = None
+        severity_highest_index_after_release = None
+
+        # Current severity: could be changed, could be the initial value
+        severity_current_index = SEVERITIES_LIST.index(bug_data['severity'])
+
+        severity_index_last_processed = None
+
+        # Look for changes to the 'severity' field and find the highest value
+        # in the history.
+        for historyItem in bug_data['history']:
+            for change in historyItem['changes']:
+                if change['field_name'] == 'severity':
+                    change_time_str = historyItem['when']
+                    change_time = datetime.datetime.strptime(change_time_str, '%Y-%m-%dT%H:%M:%SZ')
+                    change_time = pytz.utc.localize(change_time)
+
+                    severity_old = str(change['removed'])
+                    severity_new = str(change['added'])
+                    severity_index_old = SEVERITIES_LIST.index(severity_old)
+                    severity_index_new = SEVERITIES_LIST.index(severity_new)
+
+                    # Ignore changes which were made after the subsequent major release
+                    if change_time > successor_release_date:
+                        if severity_index_last_processed is None:
+                            # Severity when the bug got created
+                            severity_index_last_processed = severity_index_old
+                        break
+
+                    # Has the release shipped?
+                    if pre_release_phase and change_time > release_date:
+                        pre_release_phase = False
+                        severity_index_at_release = severity_index_old
+                        severity_highest_index_before_release = max(severity_highest_index_before_release, severity_index_old)
+                        severity_highest_index_after_release = severity_index_new
+
+                    # Before release
+                    if pre_release_phase:
+                        if severity_highest_index_before_release is None:
+                            # Severity when the bug got created
+                            severity_highest_index_before_release = severity_index_old
+                        severity_highest_index_before_release = max(severity_highest_index_before_release, severity_index_new)
+                    # After release
+                    else:
+                        if severity_highest_index_after_release is None:
+                            severity_highest_index_after_release = severity_index_new
+                        else:
+                            severity_highest_index_after_release = max(severity_highest_index_after_release, severity_index_new)
+        if severity_index_last_processed is None:
+            severity_index_last_processed = severity_current_index
+        if pre_release_phase:
+            # Never a change to severity, current state is start state.
+            if severity_highest_index_before_release is None:
+                severity_highest_index_before_release = severity_index_last_processed
+            if severity_index_at_release is None:
+                severity_index_at_release = severity_index_last_processed
+                severity_highest_index_after_release = severity_index_last_processed
+        sev_before_release = SEVERITIES_LIST[severity_highest_index_before_release]
+        sev_at_release = SEVERITIES_LIST[severity_index_at_release]
+        sev_after_release = SEVERITIES_LIST[severity_highest_index_after_release]
+        sev_group_before_release = SEVERITIES_GROUP_LIST.index(SEVERITIES[sev_before_release])
+        sev_group_at_release = SEVERITIES_GROUP_LIST.index(SEVERITIES[sev_at_release])
+        sev_group_after_release = SEVERITIES_GROUP_LIST.index(SEVERITIES[sev_after_release])
+        # if sev_group_before_release > sev_group_at_release:
+        #     print('bug severity decreased before release - bug', bug_data['id'])
+        #     print('severity_highest_index_before_release', severity_highest_index_before_release)
+        #     print('severity_index_at_release', severity_index_at_release)
+        # if sev_group_before_release < sev_group_at_release:
+        #     print('bug severity increased before release - bug', bug_data['id'])
+        #     print('severity_highest_index_before_release', severity_highest_index_before_release)
+        #     print('severity_index_at_release', severity_index_at_release)
+        print(u'bug: {} - summary: {}'.format(bug_data['id'], bug_data['summary']))
+        if sev_group_before_release > sev_group_at_release and sev_group_after_release > sev_group_at_release:
+            print('bug: {}'.format(bug_data['id']))
+            print('product: {}'.format(bug_data['product']))
+            print('status_flag_version: {}'.format(bug_data[status_flag_version]))
+            print('status_flag_successor_version: {}'.format(bug_data[status_flag_successor_version]))
+            print('component: {}'.format(bug_data['component']))
+            print('assignee email: {}'.format(bug_data['assigned_to_detail']['email']))
+            print('summary: {}'.format(bug_data['summary']))
+            sev_lowered_and_increased.append([
+                                             bug_data['id'],
+                                             bug_data['product'],
+                                             bug_data[status_flag_version],
+                                             bug_data[status_flag_successor_version],
+                                             bug_data['component'],
+                                             bug_data['assigned_to_detail']['email'],
+                                             bug_data['summary'],
+                                            ])
+        if sev_group_after_release > sev_group_at_release:
+            print('bug: {}'.format(bug_data['id']))
+            print('product: {}'.format(bug_data['product']))
+            print('status_flag_version: {}'.format(bug_data[status_flag_version]))
+            print('status_flag_successor_version: {}'.format(bug_data[status_flag_successor_version]))
+            print('component: {}'.format(bug_data['component']))
+            print('assignee email: {}'.format(bug_data['assigned_to_detail']['email']))
+            print('summary: {}'.format(bug_data['summary']))
+            sev_increased_after_release.append([
+                                                bug_data['id'],
+                                                bug_data['product'],
+                                                bug_data[status_flag_version],
+                                                bug_data[status_flag_successor_version],
+                                                bug_data['component'],
+                                                bug_data['assigned_to_detail']['email'],
+                                                bug_data['summary'],
+                                              ])
+        #    print('bug severity increased after release - bug', bug_data['id'])
+        #    print('severity_highest_index_before_release', severity_highest_index_before_release)
+        #    print('severity_highest_index_after_release', severity_highest_index_after_release)
+        # if sev_group_after_release < sev_group_at_release:
+        #     print('bug severity decreased after release - bug', bug_data['id'])
+        #     print('severity_highest_index_before_release', severity_highest_index_before_release)
+        #     print('severity_highest_index_after_release', severity_highest_index_after_release)
+
+        creation = utils.get_date(bug_data['creation_time'])
         year, week, _ = creation.isocalendar()
         t = WFMT.format(year, week)
-        data[SEVERITIES[sev]][t] += 1
+        sev_group_highest = SEVERITIES_GROUP_LIST[max(sev_group_before_release, sev_group_after_release)]
+        data_opened[sev_group_highest][t] += 1
 
-    weeks = get_weeks(nightly_start, beta_start)
-    data = {sev: {w: 0 for w in weeks} for sev in set(SEVERITIES.values())}
+    sev_lowered_and_increased = []
+    sev_increased_after_release = []
+
+    weeks_opened = get_weeks(nightly_start, release_date)
+    data_opened = {sev: {w: 0 for w in weeks_opened} for sev in set(SEVERITIES.values())}
+
+    weeks_open_accum = get_weeks(nightly_start, successor_release_date)
+    data_open_accum = {sev: {w: 0 for w in weeks_open_accum} for sev in set(SEVERITIES.values())}
 
     # Load Bugzilla data from file
     if bzdata_load_path:
         for bug_data in bugzilla_data_loaded['opened']['nightly']['data']:
-            bug_handler(bug_data, data)
+            bug_handler(bug_data, data_opened)
     # Load Bugzilla data from Bugzilla server
     else:
         queries = []
-        fields = ['creation_time', 'severity']
+        fields = [
+                  'id',
+                  'summary',
+                  'product',
+                  'component',
+                  'creation_time',
+                  'severity',
+                  'assigned_to',
+                  status_flag_version,
+                  status_flag_successor_version,
+                  'history'
+                 ]
 
         nightly_params = {
             'include_fields': fields,
@@ -102,20 +267,12 @@ def get_bugs(major):
             'f2': 'creation_ts',
             'o2': 'lessthan',
             'v2': '',
-            'f3': 'cf_last_resolved',
-            'o3': 'lessthan',
-            'v3': beta_start,
-            'f4': 'bug_severity',
-            'o4': 'notequals',
-            'v4': 'enhancement',
-            'f5': 'keywords',
-            'o5': 'notsubstring',
-            'v5': 'meta',
-            'f6': 'resolution',
-            'o6': 'isnotempty',
-            'f7': 'cf_status_firefox' + str(major),
-            'o7': 'anyexact',
-            'v7': 'affected, fix-optional, fixed, wontfix, verified, disabled'
+            'f3': 'bug_severity',
+            'o3': 'notequals',
+            'v3': 'enhancement',
+            'f4': 'keywords',
+            'o4': 'notsubstring',
+            'v4': 'meta',
         }
 
         beta_params = {
@@ -127,29 +284,26 @@ def get_bugs(major):
             'f2': 'creation_ts',
             'o2': 'lessthan',
             'v2': '',
-            'f3': 'cf_last_resolved',
-            'o3': 'lessthan',
-            'v3': release_date,
-            'f4': 'bug_severity',
-            'o4': 'notequals',
-            'v4': 'enhancement',
-            'f5': 'keywords',
-            'o5': 'notsubstring',
-            'v5': 'meta',
-            'f6': 'resolution',
-            'o6': 'isnotempty',
-            'f7': 'cf_status_firefox' + str(major),
-            'o7': 'anyexact',
-            'v7': 'affected, fix-optional, fixed, wontfix, verified, disabled'
+            'f3': 'bug_severity',
+            'o3': 'notequals',
+            'v3': 'enhancement',
+            'f4': 'keywords',
+            'o4': 'notsubstring',
+            'v4': 'meta',
+            'f5': status_flag_version,
+            'o5': 'anyexact',
+            'v5': 'affected, fix-optional, fixed, wontfix, verified, disabled',
         }
 
         phases = [
             {
+                'name' : 'nightly',
                 'query_params' : nightly_params,
                 'start_date' : nightly_start,
                 'end_date' : beta_start,
             },
             {
+                'name' : 'beta',
                 'query_params' : beta_params,
                 'start_date' : beta_start,
                 'end_date' : release_date,
@@ -157,9 +311,9 @@ def get_bugs(major):
         ]
         for phase in phases:
             query_start = phase['start_date']
-            print('New phase')
-            print('query_start:', query_start)
-            print('end_date:', phase['end_date'])
+            # print('New phase')
+            # print('query_start:', query_start)
+            # print('end_date:', phase['end_date'])
             while query_start <= phase['end_date']:
                 query_end = query_start + relativedelta(days=30)
                 params = phase['query_params'].copy()
@@ -172,27 +326,39 @@ def get_bugs(major):
 
                 queries.append(Bugzilla(params,
                                         bughandler=bug_handler,
-                                        bugdata=data,
+                                        bugdata={
+                                                 'phase' : phase['name'],
+                                                 'data_opened' : data_opened,
+                                                 'sev_lowered_and_increased' : sev_lowered_and_increased,
+                                                 'sev_increased_after_release' : sev_increased_after_release,
+                                                },
                                         timeout=960))
                 query_start = query_end
-                print('query_start:', query_start)
-                print('end_date:', phase['end_date'])
+                # print('query_start:', query_start)
+                # print('end_date:', phase['end_date'])
 
         for q in queries:
             q.get_data().wait()
 
     y, w, _ = beta_start.isocalendar()
-    data['first_beta'] = WFMT.format(y, w)
+    data_opened['first_beta'] = WFMT.format(y, w)
 
-    return data
-
+    return (
+            data_opened,
+            sev_lowered_and_increased,
+            sev_increased_after_release,
+           )
 
 def log(message):
     print(message)
 
 
 def write_csv(major):
-    data = get_bugs(major)
+    (
+     data_opened,
+     sev_lowered_and_increased,
+     sev_increased_after_release,
+    ) = get_bugs(major)
     with open('data/bugs_count_{}.csv'.format(major), 'w') as Out:
         writer = csv.writer(Out, delimiter=',')
 
@@ -203,13 +369,46 @@ def write_csv(major):
         writer.writerow([])
         writer.writerow([])
 
-        weeks = list(sorted(data['normal'].keys()))
+        writer.writerow(['Opened bugs by week'])
+        weeks = list(sorted(data_opened['normal'].keys()))
         head = ['Severity'] + weeks
         writer.writerow(head)
         for sev in ['blocker+critical+major', 'normal', 'minor+trivial']:
-            numbers = data[sev]
+            numbers = data_opened[sev]
             numbers = [numbers[w] for w in weeks]
             writer.writerow([sev] + numbers)
+
+        writer.writerow([])
+        writer.writerow([])
+
+        writer.writerow(['Bugs with severity significantly lowered before release and increased afterwards'])
+        writer.writerow([
+                         'Bug ID',
+                         'Product',
+                         'Status Version %'.format(major),
+                         'Status Version %'.format(major + 1),
+                         'Component',
+                         'Assignee',
+                         'Summary',
+                       ])
+        for row in sev_lowered_and_increased:
+            writer.writerow(row)
+
+        writer.writerow([])
+        writer.writerow([])
+
+        writer.writerow(['Bugs with severity significantly increased after release'])
+        writer.writerow([
+                         'Bug ID',
+                         'Product',
+                         'Status Version %'.format(major),
+                         'Status Version %'.format(major + 1),
+                         'Component',
+                         'Assignee',
+                         'Summary',
+                       ])
+        for row in sev_increased_after_release:
+            writer.writerow(row)
 
 
 parser = argparse.ArgumentParser(description='Count bugs created and fixed before release, by week')
@@ -229,6 +428,10 @@ args = parser.parse_args()
 
 # Firefox version for which the report gets generated.
 product_version = args.product_version
+
+# Bugzilla status flag for this version
+status_flag_version = 'cf_status_firefox' + str(product_version)
+status_flag_successor_version = 'cf_status_firefox' + str(product_version + 1)
 
 # nightly_start is the date for the first nightly
 # beta_start is the datetime the first beta build started (or now if no beta yet)
